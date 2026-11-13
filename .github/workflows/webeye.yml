@@ -1,0 +1,95 @@
+name: webeye
+# "Me on websites" from the cloud: dispatch this with a URL and a headless Chromium
+# visits it, extracts the text, screenshots the page, and sends both to Telegram.
+#   gh workflow run webeye -R bedai2030-cell/seconddark-cron -f url=https://example.com
+# or: POST /repos/bedai2030-cell/seconddark-cron/dispatches {"event_type":"webeye",
+#      "client_payload":{"url":"https://example.com","shot":true}}
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "The page to visit"
+        required: true
+      shot:
+        description: "Also screenshot the page (true/false)"
+        default: "true"
+  repository_dispatch:
+    types: [webeye]
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Work out the URL
+        id: in
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "url=${{ github.event.client_payload.url }}" >> $GITHUB_OUTPUT
+            echo "shot=${{ github.event.client_payload.shot }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=${{ github.event.inputs.url }}" >> $GITHUB_OUTPUT
+            echo "shot=${{ github.event.inputs.shot }}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Visit the page
+        run: |
+          npm i playwright@1.49.1 --no-fund --no-audit
+          npx playwright install chromium --with-deps > /dev/null
+          cat > visit.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          const url = process.env.URL;
+          const browser = await chromium.launch();
+          const page = await browser.newPage({ viewport: { width: 1280, height: 1600 } });
+          await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
+          await page.waitForTimeout(2500);
+          const title = await page.title();
+          const text = (await page.evaluate(() => document.body?.innerText || '')).replace(/\n{3,}/g, '\n\n').slice(0, 12000);
+          fs.writeFileSync('page.txt', `TITLE: ${title}\nURL: ${url}\n\n${text}`);
+          if (process.env.SHOT === 'true') await page.screenshot({ path: 'page.png', fullPage: false });
+          await browser.close();
+          console.log(`TITLE: ${title}`);
+          EOF
+          URL="${{ steps.in.outputs.url }}" SHOT="${{ steps.in.outputs.shot || 'true' }}" node visit.mjs
+
+      - name: Send text to Telegram
+        run: |
+          python3 - <<'EOF'
+          import os, urllib.request, json
+          tok, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
+          text = open("page.txt", encoding="utf-8").read()
+          for i in range(0, len(text), 3800):
+              body = json.dumps({"chat_id": chat, "text": text[i:i+3800]}).encode()
+              req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=body,
+                                           headers={"Content-Type": "application/json"})
+              urllib.request.urlopen(req, timeout=30)
+          print("text sent")
+          EOF
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Send screenshot to Telegram
+        if: ${{ steps.in.outputs.shot != 'false' }}
+        run: |
+          if [ -f page.png ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+              -F chat_id="${TELEGRAM_CHAT_ID}" -F caption="webeye: ${URL}" -F photo=@page.png
+          fi
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          URL: ${{ steps.in.outputs.url }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webeye-${{ github.run_id }}
+          path: |
+            page.txt
+            page.png
+          if-no-files-found: ignore
