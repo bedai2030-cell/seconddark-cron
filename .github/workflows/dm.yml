@@ -1,0 +1,72 @@
+name: Instagram comment→DM bot
+# Runs in this PUBLIC repo on purpose: public repos get free unlimited Actions minutes,
+# so the private poster repo's 2,000 min/month quota is never spent on polling.
+# The bot checks out the private poster repo, runs there in-place, and pushes state back.
+
+on:
+  schedule:
+    # Every 5 min - free here. FOLDER comments get answered fast.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ig-dm
+  cancel-in-progress: false
+
+jobs:
+  dmbot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the private poster repo
+        uses: actions/checkout@v4
+        with:
+          repository: bedai2030-cell/seconddark-poster
+          token: ${{ secrets.GH_PAT }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run comment→DM bot
+        id: dmbot
+        env:
+          COMPOSIO_CONSUMER_KEY: ${{ secrets.COMPOSIO_CONSUMER_KEY }}
+        run: python ig_dm_bot.py
+
+      - name: Push state back to the private repo
+        if: steps.dmbot.outcome == 'success'
+        run: |
+          git config user.name "seconddark-cron"
+          git config user.email "actions@users.noreply.github.com"
+          git add dmtrack.json dmlog.txt tutorial.html
+          if git diff --cached --quiet; then
+            echo "No state changes"
+          else
+            git commit -m "state: DM bot run"
+            git push
+          fi
+
+      - name: Daily heartbeat (keeps this repo's schedule active past GitHub's 60-day rule)
+        run: |
+          date -u +"%Y-%m-%d" > heartbeat.txt
+          git add heartbeat.txt
+          if ! git diff --cached --quiet; then
+            git config user.name "seconddark-cron"
+            git config user.email "actions@users.noreply.github.com"
+            git commit -m "heartbeat: schedule alive"
+            git push
+          fi
+
+      - name: Phone home on failure
+        if: failure()
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.GH_PAT }}@github.com/bedai2030-cell/seconddark-poster" poster
+          cd poster
+          python notify_phone.py voice "Second Dark alert. The Instagram D M bot crashed on its last run. Check GitHub Actions." "DM bot FAILED"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
